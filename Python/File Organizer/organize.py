@@ -11,14 +11,47 @@ import rarfile  # For .rar support
 import gzip  # For .gz support
 from tqdm import tqdm  # For progress bar
 
-# Configure logging
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging with support for dynamic configuration via arguments or environment variables
+def configure_logging():
+    log_level = os.getenv("LOG_LEVEL", "WARNING").upper()
+    log_format = os.getenv("LOG_FORMAT", "%(asctime)s - %(levelname)s - %(message)s")
+    logging.basicConfig(level=getattr(logging, log_level, logging.WARNING), format=log_format)
 
-# Python Script for Linux, WSL or other Unix-based systems
-# This script organizes files by grouping them based on their names and version numbers,
-# extracting archives when needed, and allowing for concurrent processing. Logs can be
-# made verbose with a -v or --verbose flag.
+configure_logging()
 
+# Check RAR support globally
+RAR_SUPPORTED = rarfile.is_rarfile_supported()
+if not RAR_SUPPORTED:
+    logging.warning("RAR support requires 'unrar' or 'bsdtar' installed on your system.")
+
+"""
+Script: organize.py
+
+Description:
+This script takes a directory and organizes files found within by grouping them based on their names and version numbers. 
+It supports extracting a variety of archive formats, processes files concurrently for better performance, and offers 
+a simulation mode to preview changes before making them. Suitable for Linux, WSL, and other Unix-like systems.
+
+Features:
+- Supports multiple archive formats: .tar, .zip, .7z, .rar, .gz
+- Groups files into directories based on simplified names and versioning.
+- Allows concurrent processing with customizable thread limits.
+- Simulation mode for previewing changes.
+- Verbosity control for detailed logging.
+- Help documentation for usage instructions.
+
+Usage:
+  python organize.py [directory] [options]
+
+Options:
+  -v, --verbose          Enable detailed logging.
+  -s, --simulate         Simulate changes without modifying files.
+  -t N, --threads=N      Limit the number of threads for concurrent processing.
+  -h, --help             Display help documentation.
+
+Example:
+  python organize.py ~/Downloads -v --simulate --threads=8
+"""
 
 def simplify_name(file_name):
     """
@@ -32,7 +65,8 @@ def simplify_name(file_name):
     """
     base_name = os.path.splitext(file_name)[0]
     base_name = base_name.replace(" ", "_")
-    match = re.match(r"([a-zA-Z0-9]+)[-_]?([0-9]+(\.[0-9]+)*)?[-_]?.*", base_name)
+    name_pattern = re.compile(r"([a-zA-Z0-9]+)[-_]?([0-9]+(?:\.[0-9]+)*)?[-_]?.*")
+    match = name_pattern.match(base_name)
     if match:
         library = match.group(1)
         version = match.group(2) or ""
@@ -69,8 +103,7 @@ def extract_file(file_path, extract_to, simulation):
                     archive.extractall(path=extract_to)
             logging.info(f"Extracted {file_path} to {extract_to}")
         elif file_path.endswith(".rar"):
-            if not rarfile.is_rarfile_supported():
-                logging.warning("RAR support requires 'unrar' or 'bsdtar' installed on your system.")
+            if not RAR_SUPPORTED:
                 return False
             if not simulation:
                 with rarfile.RarFile(file_path) as rar:
@@ -127,7 +160,7 @@ def process_file(item, base_dir, simulation):
         logging.info(f"Moved {item.name} to {specific_folder_path}")
 
 
-def organize_downloads(base_dir, verbosity=False, simulation=False):
+def organize_downloads(base_dir, verbosity=False, simulation=False, max_threads=4):
     """
     Organize files in the specified base directory by grouping them based on their names and version numbers.
 
@@ -135,17 +168,22 @@ def organize_downloads(base_dir, verbosity=False, simulation=False):
         base_dir (str): The base directory to organize files into.
         verbosity (bool): Enable verbose logging if True.
         simulation (bool): If True, simulate organization without making changes.
+        max_threads (int): Limit the number of threads for concurrent processing.
     """
     if verbosity:
         logging.getLogger().setLevel(logging.INFO)
     if base_dir.startswith("$HOME"):
         base_dir = base_dir.replace("$HOME", os.path.expanduser("~"))
+        if not os.path.isdir(base_dir):
+            logging.error(f"Resolved path is not a valid directory: {base_dir}")
+            return
+
     if not os.path.exists(base_dir):
         logging.error(f"The directory {base_dir} does not exist.")
         return
 
     items = [item for item in os.scandir(base_dir) if not item.is_dir()]
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_threads) as executor:
         futures = [executor.submit(process_file, item, base_dir, simulation) for item in tqdm(items, desc="Processing files")]
         for future in concurrent.futures.as_completed(futures):
             future.result()
@@ -157,9 +195,10 @@ if __name__ == "__main__":
     if "--help" in args or "-h" in args:
         print("Usage: python organize.py [directory] [options]")
         print("Options:")
-        print("  -v, --verbose    Enable detailed logging")
-        print("  -s, --simulate   Simulate changes without modifying files")
-        sys.exit(0)
+        print("  -v, --verbose          Enable detailed logging")
+        print("  -s, --simulate         Simulate changes without modifying files")
+        print("  --threads=N, -t N      Limit the number of threads for concurrent processing")
+        print("  -h, --help             Display help documentation")
 
     verbosity = any(arg in args for arg in ("-v", "--verbose"))
     simulation = any(arg in args for arg in ("-s", "--simulate", "--dry-run"))
