@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s -
 # extracting archives when needed, and allowing for concurrent processing. Logs can be
 # made verbose with a -v or --verbose flag.
 
+
 def simplify_name(file_name):
     """
     Simplify the given file name by removing extensions and replacing spaces with underscores.
@@ -37,6 +38,7 @@ def simplify_name(file_name):
         version = match.group(2) or ""
         return f"{library}-{version}" if version else library
     return base_name
+
 
 def extract_file(file_path, extract_to, simulation):
     """
@@ -67,6 +69,9 @@ def extract_file(file_path, extract_to, simulation):
                     archive.extractall(path=extract_to)
             logging.info(f"Extracted {file_path} to {extract_to}")
         elif file_path.endswith(".rar"):
+            if not rarfile.is_rarfile_supported():
+                logging.warning("RAR support requires 'unrar' or 'bsdtar' installed on your system.")
+                return False
             if not simulation:
                 with rarfile.RarFile(file_path) as rar:
                     rar.extractall(path=extract_to)
@@ -84,6 +89,7 @@ def extract_file(file_path, extract_to, simulation):
     except Exception as e:
         logging.error(f"Failed to extract {file_path}: {e}")
         return False
+
 
 def process_file(item, base_dir, simulation):
     """
@@ -120,6 +126,7 @@ def process_file(item, base_dir, simulation):
             shutil.move(item_path, new_file_path)
         logging.info(f"Moved {item.name} to {specific_folder_path}")
 
+
 def organize_downloads(base_dir, verbosity=False, simulation=False):
     """
     Organize files in the specified base directory by grouping them based on their names and version numbers.
@@ -143,10 +150,19 @@ def organize_downloads(base_dir, verbosity=False, simulation=False):
         for future in concurrent.futures.as_completed(futures):
             future.result()
 
+
 if __name__ == "__main__":
     args = sys.argv[1:]
-    verbosity = "-v" in args or "--verbose" in args
-    simulation = "-s" in args or "--simulate" in args or "--dry-run" in args
+
+    if "--help" in args:
+        print("Usage: python organize.py [directory] [options]")
+        print("Options:")
+        print("  -v, --verbose    Enable detailed logging")
+        print("  -s, --simulate   Simulate changes without modifying files")
+        sys.exit(0)
+
+    verbosity = any(arg in args for arg in ("-v", "--verbose"))
+    simulation = any(arg in args for arg in ("-s", "--simulate", "--dry-run"))
 
     # Get the base directory
     base_dir = next((arg for arg in args if not arg.startswith("-")), os.getcwd())
