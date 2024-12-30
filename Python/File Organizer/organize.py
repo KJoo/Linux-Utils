@@ -154,7 +154,7 @@ def organize_downloads(base_dir, verbosity=False, simulation=False):
 if __name__ == "__main__":
     args = sys.argv[1:]
 
-    if "--help" in args:
+    if "--help" in args or "-h" in args:
         print("Usage: python organize.py [directory] [options]")
         print("Options:")
         print("  -v, --verbose    Enable detailed logging")
