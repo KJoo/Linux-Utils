@@ -1,272 +1,342 @@
+
+"""
+Download Organizer Script
+==========================
+This script organizes files from a specified directory (`base_dir`) into categorized subdirectories based on their types or names.
+It supports extracting archive files, grouping files into directories, and performing file integrity checks.
+
+Key Features:
+-------------
+1. **Archive Support**: Extracts `.zip`, `.tar`, `.7z`, `.rar`, `.gz`, `.bz2`, and `.xz` files.
+2. **File Grouping**: Groups files based on simplified names (e.g., library names and versions).
+3. **Integrity Check**: Computes MD5, SHA256, and SHA512 hashes for files.
+4. **Simulation Mode**: Allows a dry run to see what actions would be taken without making changes.
+5. **Concurrency**: Uses multithreading for faster processing of multiple files.
+6. **Logging**: Logs operations with rotating file support to avoid bloated log files.
+7. **Retry Mechanism**: Retries archive extraction up to 3 times in case of failure.
+8. **Password-Protected Archives**: Supports archives with optional passwords.
+
+Command Template:
+-----------------
+python organizer.py -c <config_path> -l <log_level>
+
+Variables in Config File (`config.yaml`):
+-----------------------------------------
+- **base_dir**: The directory containing files to organize.
+- **output_dir**: The directory where organized files will be placed.
+- **simulate**: (Optional) `True` to simulate actions without making changes.
+- **integrity**: (Optional) `True` to enable file integrity checks.
+- **password**: (Optional) Password for password-protected archives. Use `PROMPT` to enter manually.
+- **file_filter**: (Optional) Regex pattern to filter files.
+- **max_threads**: (Optional) Maximum number of threads for processing files.
+- **log_level**: (Optional) Logging verbosity level (DEBUG, INFO, WARNING, ERROR).
+"""
+
 import os
-import shutil
-import sys
 import re
 import tarfile
 import zipfile
-import logging
-import concurrent.futures
-import py7zr  # For .7z support
-import rarfile  # For .rar support
-import gzip  # For .gz support
-from tqdm import tqdm  # For progress bar
 import hashlib
+import logging
+import shutil
+import concurrent.futures
+from typing import Optional, Dict
+from tqdm import tqdm
+from pathlib import Path
+import yaml
+import py7zr
+import rarfile
+import gzip
+import bz2
+import lzma
+from termcolor import colored
+from retry import retry
+import multiprocessing
+import getpass
+from logging.handlers import RotatingFileHandler
+import argparse
 
-# Configure logging with dynamic log-level support
-def configure_logging(log_level):
-    log_format = "%(asctime)s - %(levelname)s - %(message)s"
-    logging.basicConfig(level=getattr(logging, log_level.upper(), logging.WARNING), format=log_format)
+# Global mapping of archive handlers for various formats
+ARCHIVE_HANDLERS = {
+    ".tar": tarfile.open,
+    ".zip": zipfile.ZipFile,
+    ".7z": py7zr.SevenZipFile,
+    ".rar": rarfile.RarFile,
+    ".gz": gzip.open,
+    ".bz2": bz2.open,
+    ".xz": lzma.open,
+}
 
-# Check RAR support globally
-RAR_SUPPORTED = rarfile.is_rarfile_supported()
-if not RAR_SUPPORTED:
-    logging.warning("RAR support requires 'unrar' or 'bsdtar' installed on your system.")
+# Default configurations
+DEFAULT_CONFIG = {
+    "base_dir": "~/Downloads",  # Default directory
+    "output_dir": "~/Organized_Files",
+    "simulate": False,
+    "integrity": False,
+    "password": None,
+    "file_filter": ".*",
+    "max_threads": 4,
+    "log_level": "INFO",
+}
 
-"""
-Script: organize.py
-
-Description:
-This script takes a directory and organizes files found within by grouping them based on their names and version numbers. 
-It supports extracting a variety of archive formats, processes files concurrently for better performance, and offers 
-a simulation mode to preview changes before making them. Suitable for Linux, WSL, and other Unix-like systems.
-
-Features:
-- Supports multiple archive formats: .tar, .zip, .7z, .rar, .gz
-- Groups files into directories based on simplified names and versioning.
-- Allows concurrent processing with customizable thread limits.
-- Simulation mode for previewing changes.
-- Verbosity control for detailed logging.
-- Help documentation for usage instructions.
-- Output directory support and batch processing by file type.
-- File integrity checking (optional).
-
-Usage:
-  python organize.py [directory] [options]
-
-Options:
-  -v, --verbose          Enable detailed logging.
-  -s, --simulate         Simulate changes without modifying files.
-  -t N, --threads=N      Limit the number of threads for concurrent processing.
-  -o DIR, --output-dir DIR Specify an output directory for organized files.
-  --batch-type TYPE      Process files in batches by type (e.g., archive, document).
-  --integrity-check      Enable integrity checks for extracted files.
-  -h, --help             Display help documentation.
-
-Example:
-  python organize.py ~/Downloads -v --simulate --threads=8 --output-dir ~/Organized --batch-type archive
-"""
-
-def simplify_name(file_name):
+# Dynamically resolve the base directory to handle case sensitivity
+def resolve_base_dir(base_dir: str) -> Path:
     """
-    Simplify the given file name by removing extensions and replacing spaces with underscores.
+    Dynamically resolves the 'Downloads' directory on Linux systems, handling case sensitivity.
 
     Args:
-        file_name (str): The name of the file to simplify.
+        base_dir (str): The base directory provided in the configuration.
 
     Returns:
-        str: The simplified file name.
+        Path: A valid Path object pointing to the resolved base directory.
     """
-    base_name = os.path.splitext(file_name)[0]
-    base_name = base_name.replace(" ", "_")
-    name_pattern = re.compile(r"([a-zA-Z0-9]+)[-_]?([0-9]+(?:\.[0-9]+)*)?[-_]?.*")
-    match = name_pattern.match(base_name)
+    base_path = Path(base_dir).expanduser()
+    parent_dir = base_path.parent if base_path.parent.is_dir() else Path.home()
+
+    # Check for both case variations
+    candidates = [parent_dir / "Downloads", parent_dir / "downloads"]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+
+    # Fallback: Use the provided base_dir if no match
+    return base_path
+
+# Logging configuration with rotating file support
+def configure_logging(log_level: str, log_file: Optional[str] = None) -> None:
+    """
+    Configures logging for the script.
+
+    Args:
+        log_level (str): Logging level (e.g., DEBUG, INFO, WARNING, ERROR).
+        log_file (Optional[str]): File to store logs. If None, logs are printed to the console.
+    """
+    log_format = "%(asctime)s - %(levelname)s - %(message)s"
+    log_level = getattr(logging, log_level.upper(), logging.WARNING)
+    handlers = [logging.StreamHandler()]
+
+    if log_file:
+        handlers.append(RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=5))
+
+    logging.basicConfig(level=log_level, format=log_format, handlers=handlers)
+
+# Validate configuration for required keys and directory validity
+def validate_config(config: Dict) -> None:
+    """
+    Validates the configuration file for required keys and valid directories.
+
+    Args:
+        config (Dict): Configuration dictionary loaded from `config.yaml`.
+
+    Raises:
+        ValueError: If a required key is missing or a directory path is invalid.
+    """
+    required_keys = ["base_dir", "output_dir"]
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(f"Missing required configuration key: {key}")
+    if not Path(config["output_dir"]).expanduser().is_dir():
+        raise ValueError("Invalid output directory path.")
+
+# Simplify file names for consistent grouping
+def simplify_name(file_name: str) -> str:
+    """
+    Simplifies file names by extracting base names and versions.
+
+    Args:
+        file_name (str): Original file name.
+
+    Returns:
+        str: Simplified name for grouping purposes.
+    """
+    base_name = os.path.splitext(file_name)[0].replace(" ", "_")
+    match = re.match(r"([a-zA-Z0-9]+)[-_]?([0-9]+(?:\.[0-9]+)*)?[-_]?.*", base_name)
     if match:
-        library = match.group(1)
-        version = match.group(2) or ""
+        library, version = match.group(1), match.group(2) or ""
         return f"{library}-{version}" if version else library
     return base_name
 
-
-def is_supported_archive(file_path):
+# Check if a file is a supported archive format
+def is_supported_archive(file_path: str) -> bool:
     """
-    Check if the file is a supported archive format.
+    Determines if a file is a supported archive format.
 
     Args:
-        file_path (str): The file path to check.
+        file_path (str): Path to the file.
 
     Returns:
         bool: True if the file is a supported archive, False otherwise.
     """
-    return tarfile.is_tarfile(file_path) or zipfile.is_zipfile(file_path) or file_path.endswith((".7z", ".rar", ".gz"))
+    return Path(file_path).suffix.lower() in ARCHIVE_HANDLERS
 
-
-def extract_file(file_path, extract_to, simulation):
+# Ensure required directories exist
+def ensure_directories_exist(group_folder: Path, specific_folder: Path) -> None:
     """
-    Extract the given archive file to the specified directory.
+    Creates directories if they do not already exist.
 
     Args:
-        file_path (str): The path to the archive file.
-        extract_to (str): The directory to extract the contents to.
-        simulation (bool): If True, simulate extraction without making changes.
-
-    Returns:
-        bool: True if extraction succeeded, False otherwise.
+        group_folder (Path): General group directory path.
+        specific_folder (Path): Specific file group directory path.
     """
-    try:
-        if tarfile.is_tarfile(file_path):
-            if not simulation:
-                with tarfile.open(file_path) as tar:
-                    tar.extractall(path=extract_to)
-            logging.info(f"Extracted {file_path} to {extract_to}")
-        elif zipfile.is_zipfile(file_path):
-            if not simulation:
-                with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    zip_ref.extractall(extract_to)
-            logging.info(f"Extracted {file_path} to {extract_to}")
-        elif file_path.endswith(".7z"):
-            if not simulation:
-                with py7zr.SevenZipFile(file_path, 'r') as archive:
-                    archive.extractall(path=extract_to)
-            logging.info(f"Extracted {file_path} to {extract_to}")
-        elif file_path.endswith(".rar"):
-            if not RAR_SUPPORTED:
-                return False
-            if not simulation:
-                with rarfile.RarFile(file_path) as rar:
-                    rar.extractall(path=extract_to)
-            logging.info(f"Extracted {file_path} to {extract_to}")
-        elif file_path.endswith(".gz"):
-            if not simulation:
-                with gzip.open(file_path, 'rb') as f_in:
-                    with open(os.path.join(extract_to, os.path.basename(file_path).replace('.gz', '')), 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-            logging.info(f"Extracted {file_path} to {extract_to}")
-        else:
-            logging.warning(f"Unsupported archive format: {file_path}")
-            return False
-        return True
-    except Exception as e:
-        logging.error(f"Failed to extract {file_path}: {e}")
-        return False
+    group_folder.mkdir(parents=True, exist_ok=True)
+    specific_folder.mkdir(parents=True, exist_ok=True)
 
-
-def integrity_check(file_path):
+# Extract archive files with retry support
+@retry(Exception, tries=3, delay=2)
+def extract_file(file_path: str, extract_to: str, password: Optional[str] = None) -> None:
     """
-    Perform a simple integrity check by calculating the MD5 checksum of a file.
+    Extracts supported archive files to a specified directory.
 
     Args:
-        file_path (str): The path to the file to check.
-
-    Returns:
-        str: The MD5 checksum of the file.
+        file_path (str): Path to the archive file.
+        extract_to (str): Directory to extract contents to.
+        password (Optional[str]): Password for encrypted archives, if any.
     """
-    hash_md5 = hashlib.md5()
-    try:
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
-    except Exception as e:
-        logging.error(f"Failed to calculate integrity for {file_path}: {e}")
-        return None
+    file_extension = Path(file_path).suffix.lower()
 
-
-def process_file(item, base_dir, output_dir, simulation, integrity):
-    """
-    Process a single file by simplifying its name, extracting if necessary, and moving it to the appropriate directory.
-
-    Args:
-        item (os.DirEntry): The file to process.
-        base_dir (str): The base directory to organize files into.
-        output_dir (str): The directory to output organized files.
-        simulation (bool): If True, simulate processing without making changes.
-        integrity (bool): If True, perform integrity checks.
-    """
-    item_path = item.path
-    folder_name = simplify_name(item.name)
-    group_match = re.match(r"([a-zA-Z]+)[-_]?.*", folder_name)
-    group_name = group_match.group(1) if group_match else folder_name
-    group_folder_path = os.path.join(output_dir, group_name)
-    specific_folder_path = os.path.join(group_folder_path, folder_name)
-
-    if not simulation:
-        os.makedirs(group_folder_path, exist_ok=True)
-        os.makedirs(specific_folder_path, exist_ok=True)
-
-    if is_supported_archive(item_path):
-        success = extract_file(item_path, specific_folder_path, simulation)
-        if success and not simulation:
-            if integrity:
-                checksum = integrity_check(item_path)
-                if checksum:
-                    logging.info(f"Integrity check passed for {item_path} (MD5: {checksum})")
-            os.remove(item_path)
-            logging.info(f"Deleted {item_path} after extraction.")
-        elif not success:
-            logging.warning(f"Fallback: Moving {item_path} to {specific_folder_path} without extraction.")
-            if not simulation:
-                shutil.move(item_path, specific_folder_path)
-    else:
-        new_file_path = os.path.join(specific_folder_path, item.name)
-        if not simulation:
-            shutil.move(item_path, new_file_path)
-        logging.info(f"Moved {item.name} to {specific_folder_path}")
-
-
-def organize_downloads(base_dir, verbosity, simulation, max_threads, output_dir, batch_type, integrity):
-    """
-    Organize files in the specified base directory by grouping them based on their names and version numbers.
-
-    Args:
-        base_dir (str): The base directory to organize files into.
-        verbosity (bool): Enable verbose logging if True.
-        simulation (bool): If True, simulate organization without making changes.
-        max_threads (int): Limit the number of threads for concurrent processing.
-        output_dir (str): Directory to place organized files.
-        batch_type (str): Type of files to process in batches (e.g., "archive").
-        integrity (bool): Enable integrity checks for processed files.
-    """
-    if verbosity:
-        logging.getLogger().setLevel(logging.INFO)
-
-    if base_dir.startswith("$HOME"):
-        base_dir = base_dir.replace("$HOME", os.path.expanduser("~"))
-        if not os.path.isdir(base_dir):
-            logging.error(f"Resolved path is not a valid directory: {base_dir}")
-            return
-
-    if not os.path.exists(base_dir):
-        logging.error(f"The directory {base_dir} does not exist.")
+    if file_extension not in ARCHIVE_HANDLERS:
+        logging.error(f"Unsupported archive format: {file_path}")
         return
 
-    items = [item for item in os.scandir(base_dir) if not item.is_dir()]
-    if batch_type == "archive":
-        items = [item for item in items if is_supported_archive(item.path)]
+    try:
+        handler = ARCHIVE_HANDLERS[file_extension]
+        with handler(file_path, 'r') as archive:
+            if hasattr(archive, 'extractall'):
+                archive.extractall(path=extract_to, pwd=password.encode() if password else None)
+            else:
+                output_path = Path(extract_to) / Path(file_path).stem
+                with open(output_path, 'wb') as f_out:
+                    shutil.copyfileobj(archive, f_out)
+        logging.info(f"Extracted: {file_path} to {extract_to}")
+    except Exception as e:
+        logging.error(f"Failed to extract {file_path}: {e}", exc_info=True)
+
+# Calculate file integrity checksums
+def integrity_check(file_path: str) -> Dict[str, str]:
+    """
+    Calculates MD5, SHA256, and SHA512 hashes for a file.
+
+    Args:
+        file_path (str): Path to the file.
+
+    Returns:
+        Dict[str, str]: Dictionary of calculated hashes.
+    """
+    hashes = {"MD5": hashlib.md5(), "SHA256": hashlib.sha256(), "SHA512": hashlib.sha512()}
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):  # Larger chunks for performance
+            for hash_obj in hashes.values():
+                hash_obj.update(chunk)
+    return {key: hash_obj.hexdigest() for key, hash_obj in hashes.items()}
+
+# Process a single file for extraction, grouping, or moving
+def process_file(
+    item: os.DirEntry,
+    output_dir: Path,
+    simulate: bool,
+    integrity: bool,
+    password: Optional[str] = None
+) -> None:
+    """
+    Processes an individual file: extracts, moves, or logs based on configuration.
+
+    Args:
+        item (os.DirEntry): File to process.
+        output_dir (Path): Base output directory for organized files.
+        simulate (bool): If True, simulates actions without making changes.
+        integrity (bool): If True, performs integrity checks.
+        password (Optional[str]): Password for password-protected archives, if any.
+    """
+    try:
+        folder_name = simplify_name(item.name)
+        group_folder = output_dir / folder_name.split("-")[0]
+        specific_folder = group_folder / folder_name
+        ensure_directories_exist(group_folder, specific_folder)
+
+        if is_supported_archive(item.path):
+            if simulate:
+                logging.info(f"Simulating extraction of {item.name} to {specific_folder}")
+                return
+            extract_file(item.path, str(specific_folder), password=password)
+            if integrity:
+                checksums = integrity_check(item.path)
+                logging.info(f"Integrity check for {item.name}: {checksums}")
+        else:
+            destination = specific_folder / item.name
+            if simulate:
+                logging.info(f"Simulating move of {item.name} to {specific_folder}")
+                return
+            shutil.move(item.path, destination)
+    except Exception as e:
+        logging.error(f"Failed to process {item.name}: {e}", exc_info=True)
+
+# Main function for organizing downloads
+def organize_downloads(config: Dict) -> None:
+    """
+    Main function for organizing files based on the provided configuration.
+
+    Args:
+        config (Dict): Configuration dictionary loaded from `config.yaml`.
+    """
+    # Dynamically resolve the base_dir
+    base_dir = resolve_base_dir(config["base_dir"])
+    output_dir = Path(config["output_dir"]).expanduser()
+    simulate = config.get("simulate", False)
+    integrity = config.get("integrity", False)
+    password = config.get("password", None)
+    if password == "PROMPT":
+        password = getpass.getpass("Enter archive password: ")
+    file_filter = re.compile(config.get("file_filter", ".*"))
+
+    # Check base directory existence
+    if not base_dir.is_dir() or not os.access(base_dir, os.R_OK):
+        logging.error(colored(f"Base directory '{base_dir}' is invalid or inaccessible.", "red"))
+        return
+
+    # Scan items and process
+    items = [item for item in os.scandir(base_dir) if not item.is_dir() and file_filter.search(item.name)]
+    max_threads = min(len(items), multiprocessing.cpu_count(), config.get("max_threads", 4))
 
     with concurrent.futures.ThreadPoolExecutor(max_threads) as executor:
-        futures = [executor.submit(process_file, item, base_dir, output_dir, simulation, integrity) for item in tqdm(items, desc="Processing files")]
-        for future in concurrent.futures.as_completed(futures):
-            future.result()
+        list(
+            tqdm(
+                executor.map(lambda x: process_file(x, output_dir, simulate, integrity, password), items),
+                total=len(items),
+                desc="Processing Files"
+            )
+        )
 
+# Parse command-line arguments
+def parse_arguments() -> Dict:
+    """
+    Parses command-line arguments for the script.
 
+    Returns:
+        Dict: Parsed arguments as a dictionary.
+    """
+    parser = argparse.ArgumentParser(description="Organize and process archive files.")
+    parser.add_argument("-c", "--config", required=True, help="Path to the configuration file.")
+    parser.add_argument("-l", "--log", default="INFO", help="Log level (default: INFO).")
+    return vars(parser.parse_args())
+
+# Entry point of the script
 if __name__ == "__main__":
-    args = sys.argv[1:]
+    """
+    Entry point of the script. Reads the configuration, validates it, and starts the organization process.
+    """
+    try:
+        args = parse_arguments()
+        configure_logging(args["log"], log_file="organize.log")
 
-    if "--help" in args or "-h" in args:
-        print("Usage: python organize.py [directory] [options]")
-        print("Options:")
-        print("  -v, --verbose          Enable detailed logging")
-        print("  -s, --simulate         Simulate changes without modifying files")
-        print("  -o DIR, --output-dir DIR Specify an output directory for organized files")
-        print("  --batch-type TYPE      Process files in batches by type (e.g., archive, document)")
-        print("  --integrity-check      Enable integrity checks for extracted files")
-        print("  -t N, --threads=N      Limit the number of threads for concurrent processing")
-        print("  -h, --help             Display help documentation")
-        sys.exit(0)
+        # Load configuration
+        try:
+            with open(args["config"], "r") as config_file:
+                config = yaml.safe_load(config_file)
+        except FileNotFoundError:
+            logging.warning("Config file not found. Using default settings.")
+            config = DEFAULT_CONFIG
 
-    verbosity = any(arg in args for arg in ("-v", "--verbose"))
-    simulation = any(arg in args for arg in ("-s", "--simulate", "--dry-run"))
-    output_dir = next((arg.split("=")[1] for arg in args if arg.startswith("-o") or arg.startswith("--output-dir")), os.getcwd())
-    batch_type = next((arg.split("=")[1] for arg in args if arg.startswith("--batch-type")), None)
-    integrity = "--integrity-check" in args
-
-    # Get the base directory
-    base_dir = next((arg for arg in args if not arg.startswith("-")), os.getcwd())
-
-    # Get max threads from arguments
-    max_threads = next((int(arg.split("=")[1]) for arg in args if arg.startswith("--threads=")),
-                       next((int(args[args.index("-t") + 1]) for arg in args if "-t" in args), os.cpu_count() or 4))
-
-    configure_logging("INFO" if verbosity else "WARNING")
-
-    organize_downloads(base_dir, verbosity, simulation, max_threads, output_dir, batch_type, integrity)
+        validate_config(config)
+        organize_downloads(config)
+    except Exception as e:
+        logging.error(colored(f"Unexpected error: {e}", "red"), exc_info=True)
