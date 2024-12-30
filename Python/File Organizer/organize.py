@@ -5,6 +5,14 @@ import re
 import tarfile
 import zipfile
 
+# Python Script for Linux, WSL or other Unix based systems 
+# which runs through the given directory, or current working 
+# directory if none is given, and organizes present files,
+# grouping each by file name and version number if applicable,
+# then creates and moves files into new directories. Any 
+# unextracted files will be also extracted and organized before 
+# deleting the originally downloaded .tar, .zip, .7z, etc.
+
 def simplify_name(file_name):
     #Remove file extension
     base_name = os.path.splitext(file_name)[0]
