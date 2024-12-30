@@ -146,7 +146,7 @@ def organize_downloads(base_dir, verbosity=False, simulation=False):
 if __name__ == "__main__":
     args = sys.argv[1:]
     verbosity = "-v" in args or "--verbose" in args
-    simulation = "--simulate" in args
+    simulation = "-s" in args or "--simulate" in args or "--dry-run" in args
 
     # Get the base directory
     base_dir = next((arg for arg in args if not arg.startswith("-")), os.getcwd())
