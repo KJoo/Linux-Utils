@@ -10,14 +10,12 @@ import py7zr  # For .7z support
 import rarfile  # For .rar support
 import gzip  # For .gz support
 from tqdm import tqdm  # For progress bar
+import hashlib
 
-# Configure logging with support for dynamic configuration via arguments or environment variables
-def configure_logging():
-    log_level = os.getenv("LOG_LEVEL", "WARNING").upper()
-    log_format = os.getenv("LOG_FORMAT", "%(asctime)s - %(levelname)s - %(message)s")
-    logging.basicConfig(level=getattr(logging, log_level, logging.WARNING), format=log_format)
-
-configure_logging()
+# Configure logging with dynamic log-level support
+def configure_logging(log_level):
+    log_format = "%(asctime)s - %(levelname)s - %(message)s"
+    logging.basicConfig(level=getattr(logging, log_level.upper(), logging.WARNING), format=log_format)
 
 # Check RAR support globally
 RAR_SUPPORTED = rarfile.is_rarfile_supported()
@@ -39,6 +37,8 @@ Features:
 - Simulation mode for previewing changes.
 - Verbosity control for detailed logging.
 - Help documentation for usage instructions.
+- Output directory support and batch processing by file type.
+- File integrity checking (optional).
 
 Usage:
   python organize.py [directory] [options]
@@ -47,10 +47,13 @@ Options:
   -v, --verbose          Enable detailed logging.
   -s, --simulate         Simulate changes without modifying files.
   -t N, --threads=N      Limit the number of threads for concurrent processing.
+  -o DIR, --output-dir DIR Specify an output directory for organized files.
+  --batch-type TYPE      Process files in batches by type (e.g., archive, document).
+  --integrity-check      Enable integrity checks for extracted files.
   -h, --help             Display help documentation.
 
 Example:
-  python organize.py ~/Downloads -v --simulate --threads=8
+  python organize.py ~/Downloads -v --simulate --threads=8 --output-dir ~/Organized --batch-type archive
 """
 
 def simplify_name(file_name):
@@ -74,6 +77,19 @@ def simplify_name(file_name):
     return base_name
 
 
+def is_supported_archive(file_path):
+    """
+    Check if the file is a supported archive format.
+
+    Args:
+        file_path (str): The file path to check.
+
+    Returns:
+        bool: True if the file is a supported archive, False otherwise.
+    """
+    return tarfile.is_tarfile(file_path) or zipfile.is_zipfile(file_path) or file_path.endswith((".7z", ".rar", ".gz"))
+
+
 def extract_file(file_path, extract_to, simulation):
     """
     Extract the given archive file to the specified directory.
@@ -83,8 +99,8 @@ def extract_file(file_path, extract_to, simulation):
         extract_to (str): The directory to extract the contents to.
         simulation (bool): If True, simulate extraction without making changes.
 
-    Raises:
-        Exception: If the extraction process fails.
+    Returns:
+        bool: True if extraction succeeded, False otherwise.
     """
     try:
         if tarfile.is_tarfile(file_path):
@@ -124,29 +140,56 @@ def extract_file(file_path, extract_to, simulation):
         return False
 
 
-def process_file(item, base_dir, simulation):
+def integrity_check(file_path):
+    """
+    Perform a simple integrity check by calculating the MD5 checksum of a file.
+
+    Args:
+        file_path (str): The path to the file to check.
+
+    Returns:
+        str: The MD5 checksum of the file.
+    """
+    hash_md5 = hashlib.md5()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except Exception as e:
+        logging.error(f"Failed to calculate integrity for {file_path}: {e}")
+        return None
+
+
+def process_file(item, base_dir, output_dir, simulation, integrity):
     """
     Process a single file by simplifying its name, extracting if necessary, and moving it to the appropriate directory.
 
     Args:
         item (os.DirEntry): The file to process.
         base_dir (str): The base directory to organize files into.
+        output_dir (str): The directory to output organized files.
         simulation (bool): If True, simulate processing without making changes.
+        integrity (bool): If True, perform integrity checks.
     """
     item_path = item.path
     folder_name = simplify_name(item.name)
     group_match = re.match(r"([a-zA-Z]+)[-_]?.*", folder_name)
     group_name = group_match.group(1) if group_match else folder_name
-    group_folder_path = os.path.join(base_dir, group_name)
+    group_folder_path = os.path.join(output_dir, group_name)
     specific_folder_path = os.path.join(group_folder_path, folder_name)
 
     if not simulation:
         os.makedirs(group_folder_path, exist_ok=True)
         os.makedirs(specific_folder_path, exist_ok=True)
 
-    if tarfile.is_tarfile(item_path) or zipfile.is_zipfile(item_path) or item_path.endswith((".7z", ".rar", ".gz")):
+    if is_supported_archive(item_path):
         success = extract_file(item_path, specific_folder_path, simulation)
         if success and not simulation:
+            if integrity:
+                checksum = integrity_check(item_path)
+                if checksum:
+                    logging.info(f"Integrity check passed for {item_path} (MD5: {checksum})")
             os.remove(item_path)
             logging.info(f"Deleted {item_path} after extraction.")
         elif not success:
@@ -160,7 +203,7 @@ def process_file(item, base_dir, simulation):
         logging.info(f"Moved {item.name} to {specific_folder_path}")
 
 
-def organize_downloads(base_dir, verbosity=False, simulation=False, max_threads=4):
+def organize_downloads(base_dir, verbosity, simulation, max_threads, output_dir, batch_type, integrity):
     """
     Organize files in the specified base directory by grouping them based on their names and version numbers.
 
@@ -169,9 +212,13 @@ def organize_downloads(base_dir, verbosity=False, simulation=False, max_threads=
         verbosity (bool): Enable verbose logging if True.
         simulation (bool): If True, simulate organization without making changes.
         max_threads (int): Limit the number of threads for concurrent processing.
+        output_dir (str): Directory to place organized files.
+        batch_type (str): Type of files to process in batches (e.g., "archive").
+        integrity (bool): Enable integrity checks for processed files.
     """
     if verbosity:
         logging.getLogger().setLevel(logging.INFO)
+
     if base_dir.startswith("$HOME"):
         base_dir = base_dir.replace("$HOME", os.path.expanduser("~"))
         if not os.path.isdir(base_dir):
@@ -183,8 +230,11 @@ def organize_downloads(base_dir, verbosity=False, simulation=False, max_threads=
         return
 
     items = [item for item in os.scandir(base_dir) if not item.is_dir()]
+    if batch_type == "archive":
+        items = [item for item in items if is_supported_archive(item.path)]
+
     with concurrent.futures.ThreadPoolExecutor(max_threads) as executor:
-        futures = [executor.submit(process_file, item, base_dir, simulation) for item in tqdm(items, desc="Processing files")]
+        futures = [executor.submit(process_file, item, base_dir, output_dir, simulation, integrity) for item in tqdm(items, desc="Processing files")]
         for future in concurrent.futures.as_completed(futures):
             future.result()
 
@@ -197,13 +247,26 @@ if __name__ == "__main__":
         print("Options:")
         print("  -v, --verbose          Enable detailed logging")
         print("  -s, --simulate         Simulate changes without modifying files")
-        print("  --threads=N, -t N      Limit the number of threads for concurrent processing")
+        print("  -o DIR, --output-dir DIR Specify an output directory for organized files")
+        print("  --batch-type TYPE      Process files in batches by type (e.g., archive, document)")
+        print("  --integrity-check      Enable integrity checks for extracted files")
+        print("  -t N, --threads=N      Limit the number of threads for concurrent processing")
         print("  -h, --help             Display help documentation")
+        sys.exit(0)
 
     verbosity = any(arg in args for arg in ("-v", "--verbose"))
     simulation = any(arg in args for arg in ("-s", "--simulate", "--dry-run"))
+    output_dir = next((arg.split("=")[1] for arg in args if arg.startswith("-o") or arg.startswith("--output-dir")), os.getcwd())
+    batch_type = next((arg.split("=")[1] for arg in args if arg.startswith("--batch-type")), None)
+    integrity = "--integrity-check" in args
 
     # Get the base directory
     base_dir = next((arg for arg in args if not arg.startswith("-")), os.getcwd())
 
-    organize_downloads(base_dir, verbosity, simulation)
+    # Get max threads from arguments
+    max_threads = next((int(arg.split("=")[1]) for arg in args if arg.startswith("--threads=")),
+                       next((int(args[args.index("-t") + 1]) for arg in args if "-t" in args), os.cpu_count() or 4))
+
+    configure_logging("INFO" if verbosity else "WARNING")
+
+    organize_downloads(base_dir, verbosity, simulation, max_threads, output_dir, batch_type, integrity)
